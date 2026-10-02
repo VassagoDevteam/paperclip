@@ -5,7 +5,6 @@ import {
   projectGoals,
   goals,
   issues,
-  budgetIncidents,
   budgetPolicies,
   pluginManagedResources,
   plugins,
@@ -29,6 +28,7 @@ import {
   type PluginManagedProjectDeclaration,
   type PluginManagedProjectResolution,
 } from "@paperclipai/shared";
+import { removeBudgetStateForScope } from "./budgets.js";
 import { unprocessable } from "../errors.js";
 import { listCurrentRuntimeServicesForProjectWorkspaces } from "./workspace-runtime-read-model.js";
 import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
@@ -948,16 +948,7 @@ export function projectService(db: Db) {
 
     remove: (id: string) =>
       db.transaction(async (tx) => {
-        // budget_policies.scope_id is polymorphic (no FK): drop project-scoped policies with
-        // the project so budget overviews never resolve a dangling scope.
-        const projectPolicyIds = tx
-          .select({ id: budgetPolicies.id })
-          .from(budgetPolicies)
-          .where(and(eq(budgetPolicies.scopeType, "project"), eq(budgetPolicies.scopeId, id)));
-        await tx.delete(budgetIncidents).where(inArray(budgetIncidents.policyId, projectPolicyIds));
-        await tx
-          .delete(budgetPolicies)
-          .where(and(eq(budgetPolicies.scopeType, "project"), eq(budgetPolicies.scopeId, id)));
+        await removeBudgetStateForScope(tx as unknown as Db, "project", id);
         const rows = await tx.delete(projects).where(eq(projects.id, id)).returning();
         const row = rows[0] ?? null;
         if (!row) return null;

@@ -85,6 +85,43 @@ function skipMissingScope(error: unknown): null {
   throw error;
 }
 
+/**
+ * Remove budget state owned by a deleted agent or project.
+ *
+ * budget_policies.scope_id is polymorphic (no FK), so the scope's delete path must call this
+ * inside its transaction. Pending approvals raised by the scope's incidents are cancelled first:
+ * with the incident gone there is nothing left to resolve, so they must not linger in the board's
+ * approval queue.
+ */
+export async function removeBudgetStateForScope(
+  db: Db,
+  scopeType: Exclude<BudgetScopeType, "company">,
+  scopeId: string,
+) {
+  const scopePolicyIds = db
+    .select({ id: budgetPolicies.id })
+    .from(budgetPolicies)
+    .where(and(eq(budgetPolicies.scopeType, scopeType), eq(budgetPolicies.scopeId, scopeId)));
+  const scopeApprovalIds = db
+    .select({ id: budgetIncidents.approvalId })
+    .from(budgetIncidents)
+    .where(inArray(budgetIncidents.policyId, scopePolicyIds));
+  const now = new Date();
+  await db
+    .update(approvals)
+    .set({
+      status: "cancelled",
+      decisionNote: `Budget ${scopeType} was deleted`,
+      decidedAt: now,
+      updatedAt: now,
+    })
+    .where(and(inArray(approvals.id, scopeApprovalIds), eq(approvals.status, "pending")));
+  await db.delete(budgetIncidents).where(inArray(budgetIncidents.policyId, scopePolicyIds));
+  await db
+    .delete(budgetPolicies)
+    .where(and(eq(budgetPolicies.scopeType, scopeType), eq(budgetPolicies.scopeId, scopeId)));
+}
+
 async function resolveScopeRecord(db: Db, scopeType: BudgetScopeType, scopeId: string): Promise<ScopeRecord> {
   if (scopeType === "company") {
     const row = await db
@@ -462,7 +499,14 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
     }
   }
 
-  async function hydrateIncidentRows(rows: IncidentRow[]): Promise<BudgetIncident[]> {
+  /**
+   * Hydrate incidents with one batched approval lookup. With `skipMissingScopes`, incidents whose
+   * agent/project no longer exists are dropped instead of failing the whole batch.
+   */
+  async function hydrateIncidentRows(
+    rows: IncidentRow[],
+    options: { skipMissingScopes?: boolean } = {},
+  ): Promise<BudgetIncident[]> {
     const approvalIds = rows.map((row) => row.approvalId).filter((value): value is string => Boolean(value));
     const approvalRows = approvalIds.length > 0
       ? await db
@@ -472,9 +516,11 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       : [];
     const approvalStatusById = new Map(approvalRows.map((row) => [row.id, row.status]));
 
-    return Promise.all(
-      rows.map(async (row) => {
-        const scope = await resolveScopeRecord(db, row.scopeType as BudgetScopeType, row.scopeId);
+    const hydrated = await Promise.all(
+      rows.map(async (row): Promise<BudgetIncident | null> => {
+        const scopeLookup = resolveScopeRecord(db, row.scopeType as BudgetScopeType, row.scopeId);
+        const scope = await (options.skipMissingScopes ? scopeLookup.catch(skipMissingScope) : scopeLookup);
+        if (!scope) return null;
         return {
           id: row.id,
           companyId: row.companyId,
@@ -498,6 +544,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         };
       }),
     );
+    return hydrated.filter((incident): incident is BudgetIncident => incident !== null);
   }
 
   return {
@@ -645,10 +692,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         .from(budgetIncidents)
         .where(and(eq(budgetIncidents.companyId, companyId), eq(budgetIncidents.status, "open")))
         .orderBy(desc(budgetIncidents.createdAt));
-      const hydratedIncidents = await Promise.all(
-        activeIncidentRows.map((row) => hydrateIncidentRows([row]).then(([incident]) => incident!).catch(skipMissingScope)),
-      );
-      const activeIncidents = hydratedIncidents.filter((incident): incident is BudgetIncident => incident !== null);
+      const activeIncidents = await hydrateIncidentRows(activeIncidentRows, { skipMissingScopes: true });
       return {
         companyId,
         policies,
