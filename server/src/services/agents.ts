@@ -11,6 +11,8 @@ import {
   agentTaskSessions,
   agentWakeupRequests,
   activityLog,
+  budgetIncidents,
+  budgetPolicies,
   costEvents,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -1083,6 +1085,16 @@ export function agentService(db: Db) {
         await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, id));
         await tx.delete(agentApiKeys).where(eq(agentApiKeys.agentId, id));
         await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.agentId, id));
+        // budget_policies.scope_id is polymorphic (no FK), so an agent-scoped policy would
+        // otherwise outlive the agent and make budget overviews throw "Agent not found".
+        const agentPolicyIds = tx
+          .select({ id: budgetPolicies.id })
+          .from(budgetPolicies)
+          .where(and(eq(budgetPolicies.scopeType, "agent"), eq(budgetPolicies.scopeId, id)));
+        await tx.delete(budgetIncidents).where(inArray(budgetIncidents.policyId, agentPolicyIds));
+        await tx
+          .delete(budgetPolicies)
+          .where(and(eq(budgetPolicies.scopeType, "agent"), eq(budgetPolicies.scopeId, id)));
         const deleted = await tx
           .delete(agents)
           .where(eq(agents.id, id))

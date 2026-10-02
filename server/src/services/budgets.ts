@@ -22,7 +22,7 @@ import type {
   BudgetThresholdType,
   BudgetWindowKind,
 } from "@paperclipai/shared";
-import { notFound, unprocessable } from "../errors.js";
+import { HttpError, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
 
 type ScopeRecord = {
@@ -77,6 +77,12 @@ function budgetStatusFromObserved(
 function normalizeScopeName(scopeType: BudgetScopeType, name: string) {
   if (scopeType === "company") return name;
   return name.trim().length > 0 ? name : scopeType;
+}
+
+/** Drop entries whose agent/project scope was deleted; rethrow anything else. */
+function skipMissingScope(error: unknown): null {
+  if (error instanceof HttpError && error.status === 404) return null;
+  throw error;
 }
 
 async function resolveScopeRecord(db: Db, scopeType: BudgetScopeType, scopeId: string): Promise<ScopeRecord> {
@@ -629,13 +635,20 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
 
     overview: async (companyId: string): Promise<BudgetOverview> => {
       const rows = await listPolicyRows(companyId);
-      const policies = await Promise.all(rows.map((row) => buildPolicySummary(row)));
+      // Aggregate views must degrade, not abort, when a policy's scope no longer exists
+      // (e.g. rows orphaned by agent/project deletes before cleanup existed). A throw here
+      // took down the dashboard and, via the startup retention sweep, server boot.
+      const summaries = await Promise.all(rows.map((row) => buildPolicySummary(row).catch(skipMissingScope)));
+      const policies = summaries.filter((policy): policy is BudgetPolicySummary => policy !== null);
       const activeIncidentRows = await db
         .select()
         .from(budgetIncidents)
         .where(and(eq(budgetIncidents.companyId, companyId), eq(budgetIncidents.status, "open")))
         .orderBy(desc(budgetIncidents.createdAt));
-      const activeIncidents = await hydrateIncidentRows(activeIncidentRows);
+      const hydratedIncidents = await Promise.all(
+        activeIncidentRows.map((row) => hydrateIncidentRows([row]).then(([incident]) => incident!).catch(skipMissingScope)),
+      );
+      const activeIncidents = hydratedIncidents.filter((incident): incident is BudgetIncident => incident !== null);
       return {
         companyId,
         policies,

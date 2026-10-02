@@ -637,4 +637,50 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     });
     expect(overviewAfterResume.activeIncidents).toHaveLength(0);
   });
+
+  it("keeps the overview working when a policy's agent or project scope no longer exists (#11545)", async () => {
+    const { companyId } = await createBudgetFixture();
+    const service = budgetService(db);
+    // Simulate rows orphaned by deletes that predate scope cleanup: the scope ids point at nothing.
+    const [orphanAgentPolicy] = await db
+      .insert(budgetPolicies)
+      .values({
+        companyId,
+        scopeType: "agent",
+        scopeId: randomUUID(),
+        metric: "billed_cents",
+        windowKind: "calendar_month_utc",
+        amount: 100,
+        isActive: true,
+      })
+      .returning();
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "project",
+      scopeId: randomUUID(),
+      metric: "billed_cents",
+      windowKind: "lifetime",
+      amount: 100,
+      isActive: true,
+    });
+    await db.insert(budgetIncidents).values({
+      companyId,
+      policyId: orphanAgentPolicy!.id,
+      scopeType: "agent",
+      scopeId: orphanAgentPolicy!.scopeId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      windowStart: new Date(Date.UTC(2026, 0, 1)),
+      windowEnd: new Date(Date.UTC(2026, 1, 1)),
+      thresholdType: "hard",
+      amountLimit: 100,
+      amountObserved: 150,
+      status: "open",
+    });
+
+    const overview = await service.overview(companyId);
+    expect(overview.policies).toEqual([]);
+    expect(overview.activeIncidents).toEqual([]);
+    expect(overview.pausedAgentCount).toBe(0);
+  });
 });
